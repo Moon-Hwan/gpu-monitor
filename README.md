@@ -44,7 +44,7 @@ It might be a good idea to not use the default file but to specify a specific fi
 The first time you connect, it should ask you for the password of the SSH key.
 If you are asked for the password multiple times, you might need to manually activate your SSH key using `ssh-add <path_to_ssh_key>`.
 If it still does not work, follow with the next steps.
-
+(Refer https://blog.naver.com/hanajava/220970169755)
 ### If you have a different user name on your local machine
 
 This will show you how to avoid having to give your user name if you use the script (and SSH).
