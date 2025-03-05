@@ -37,9 +37,10 @@ If you did this already, you are fine.
 1. Open a terminal and run `cd .ssh`
 2. Run `ssh-keygen` and follow the instructions.
 It might be a good idea to not use the default file but to specify a specific filename reflecting the servers you are connecting to.
-3. Run `ssh-copy-id <user>@<server>`, where `<user>@<server>` is the server you want to connect. If you chose a different filename for your key, you need to pass the filename with the `-i` option.
-4. Repeat step 3 for every server you want to connect to (not necessary if you have a shared home directory on all the servers).
-5. Try to connect to the server using `ssh <user>@<server>`.
+3. Run `ssh-copy-id -p<portnumber> <user>@<server>`, where `<user>@<server>` is the server you want to connect. If you chose a different filename for your key, you need to pass the filename with the `-i` option.
+4. Enter the password of the target server.
+5. Repeat step 3,4 for every server you want to connect to (not necessary if you have a shared home directory on all the servers).
+6. Try to connect to the server using `ssh <user>@<server>`.
 The first time you connect, it should ask you for the password of the SSH key.
 If you are asked for the password multiple times, you might need to manually activate your SSH key using `ssh-add <path_to_ssh_key>`.
 If it still does not work, follow with the next steps.
@@ -52,7 +53,7 @@ This will show you how to avoid having to give your user name if you use the scr
 If it is not there, create it.
 2. Add something like this:
 ```
-Host myserver.com
+Host 10.100.000.000 -p<portnumber>
 User myusername
 ```
 If you are connecting to multiple servers under the same domain, you can also use `Host *.mydomain.com` to indicate that you are using the same user name for all of them.
