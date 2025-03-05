@@ -1,293 +1,274 @@
 #!/usr/bin/env python3
-"""Script to check the state of GPU servers
-
-This script is most useful in conjunction with an ssh-key, so a password does
-not have to be entered for each SSH connection.
 """
+Script to continuously monitor and display the state of GPU servers, including user information.
+
+Server entries in the server file should be provided as follows:
+    10.150.52.155 -p80
+    10.150.21.151 -p80
+    10.150.20.213 -p22222
+
+This script is particularly useful when used with an SSH key, so that a password is not required for each SSH connection.
+"""
+
 import argparse
 import logging
 import os
-import pwd
 import subprocess
 import sys
+import time
 import xml.etree.ElementTree as ET
+import curses
 from collections import defaultdict
-from functools import partial
-from logging import debug, info, error
 
-# Default timeout in seconds after which SSH stops trying to connect
-DEFAULT_SSH_TIMEOUT = 3
+# Default timeout (in seconds) after which SSH stops trying to connect
+DEFAULT_SSH_TIMEOUT = 5
 
-# Default timeout in seconds after which remote commands are interrupted
+# Default timeout (in seconds) after which remote commands are interrupted
 DEFAULT_CMD_TIMEOUT = 10
 
 # Default server file
-DEFAULT_SERVER_FILE = 'servers.txt'
-SERVER_FILE_PATH = os.path.join(os.path.dirname(os.path.realpath(sys.argv[0])),
-                                DEFAULT_SERVER_FILE)
+DEFAULT_SERVER_FILE = "serversV2.txt"
+SERVER_FILE_PATH = os.path.join(
+    os.path.dirname(os.path.realpath(sys.argv[0])), DEFAULT_SERVER_FILE
+)
 
-parser = argparse.ArgumentParser(description='Check state of GPU servers')
-parser.add_argument('-v', '--verbose', action='store_true',
-                    help='Be verbose')
-parser.add_argument('-l', '--list', action='store_true', help='Show used GPUs')
-parser.add_argument('-f', '--finger', action='store_true',
-                    help='Attempt to resolve user names to real names')
-parser.add_argument('-m', '--me', action='store_true',
-                    help='Show only GPUs used by current user')
-parser.add_argument('-u', '--user', help='Shows only GPUs used by a user')
-parser.add_argument('-s', '--ssh-user', default=None,
-                    help='Username to use to connect with SSH')
-parser.add_argument('--ssh-timeout', default=DEFAULT_SSH_TIMEOUT,
-                    help='Timeout in seconds after which SSH stops to connect')
-parser.add_argument('--cmd-timeout', default=DEFAULT_CMD_TIMEOUT,
-                    help=('Timeout in seconds after which nvidia-smi '
-                          'is interrupted'))
-parser.add_argument('--server-file', default=SERVER_FILE_PATH,
-                    help='File with addresses of servers to check')
-parser.add_argument('servers', nargs='*', default=[],
-                    help='Servers to probe')
-
-# SSH command
-SSH_CMD = ('ssh -o "ConnectTimeout={ssh_timeout}" {server} '
-           'timeout {cmd_timeout}')
-
-# Command for running nvidia-smi locally
-NVIDIASMI_CMD = 'nvidia-smi -q -x'
-
-# Command for running nvidia-smi remotely
-REMOTE_NVIDIASMI_CMD = '{} {}'.format(SSH_CMD, NVIDIASMI_CMD)
-
-# Command for running ps locally
-PS_CMD = 'ps -o pid= -o ruser= -p {pids}'
-
-# Command for running ps remotely
-REMOTE_PS_CMD = '{} {}'.format(SSH_CMD, PS_CMD)
-
-# Command for getting real names remotely
-# See https://stackoverflow.com/a/38235661
-REAL_NAMES_CMD = """<<-"EOF"
-import pwd
-for user in [{users}]:
-    try:
-        print(pwd.getpwnam(user).pw_gecos)
-    except KeyError:
-        print('Unknown')
-EOF
-"""
-REMOTE_REAL_NAMES_CMD = '{} python - {}'.format(SSH_CMD, REAL_NAMES_CMD)
+parser = argparse.ArgumentParser(description="Continuously check state of GPU servers")
+parser.add_argument("-v", "--verbose", action="store_true", help="Enable verbose output")
+parser.add_argument(
+    "-s", "--ssh-user", default=None, help="Username to use for SSH connections"
+)
+parser.add_argument(
+    "--ssh-timeout",
+    default=DEFAULT_SSH_TIMEOUT,
+    help="Timeout (in seconds) after which SSH stops trying to connect",
+)
+parser.add_argument(
+    "--cmd-timeout",
+    default=DEFAULT_CMD_TIMEOUT,
+    help="Timeout (in seconds) after which nvidia-smi is interrupted",
+)
+parser.add_argument(
+    "--server-file", default=SERVER_FILE_PATH, help="File containing addresses of GPU servers"
+)
+parser.add_argument(
+    "--refresh-interval", type=int, default=1, help="Refresh interval in seconds"
+)
+args = parser.parse_args()
 
 
-def run_command(cmd):
-    debug('Running command: "{}"'.format(cmd))
+def parse_server(server_str):
+    """
+    Parse a server string that includes an IP and an optional port in the format: "IP -pPORT".
+    Returns a tuple (host, port) where port is None if not provided.
+    """
+    parts = server_str.split()
+    host = parts[0]
+    port = None
+    for part in parts[1:]:
+        if part.startswith("-p"):
+            port = part[2:]
+    return host, port
 
-    try:
-        res = subprocess.check_output(cmd, shell=True)
-    except subprocess.TimeoutExpired as e:
-        debug(('Command timeouted with output "{}", '
-               'and stderr "{}"'.format(e.output.decode('utf-8'), e.stderr)))
-        return None
-    except subprocess.CalledProcessError as e:
-        debug(('Command failed with exit code {}, output "{}", '
-               'and stderr "{}"'.format(e.returncode,
-                                        e.output.decode('utf-8'),
-                                        e.stderr)))
-        return None
 
-    return res
+def build_ssh_command(server, remote_cmd):
+    """
+    Build an SSH command as a list by incorporating the host (and port if provided).
+    If args.ssh_user is set, it prefixes the host.
+    """
+    host, port = parse_server(server)
+    ssh_cmd = ["ssh"]
+    if port:
+        ssh_cmd.extend(["-p", port])
+    if args.ssh_user:
+        host = f"{args.ssh_user}@{host}"
+    ssh_cmd.append(host)
+    ssh_cmd.append(remote_cmd)
+    return ssh_cmd
 
 
 def run_nvidiasmi_local():
-    res = run_command(NVIDIASMI_CMD)
-    return ET.fromstring(res) if res is not None else None
-
-
-def run_nvidiasmi_remote(server, ssh_timeout, cmd_timeout):
-    cmd = REMOTE_NVIDIASMI_CMD.format(server=server,
-                                      ssh_timeout=ssh_timeout,
-                                      cmd_timeout=cmd_timeout)
-    res = run_command(cmd)
-    return ET.fromstring(res) if res is not None else None
-
-
-def run_ps_local(pids):
-    cmd = PS_CMD.format(pids=','.join(pids))
-    res = run_command(cmd)
-    return res.decode('ascii') if res is not None else None
-
-
-def run_ps_remote(server, pids, ssh_timeout, cmd_timeout):
-    cmd = REMOTE_PS_CMD.format(server=server,
-                               pids=','.join(pids),
-                               ssh_timeout=ssh_timeout,
-                               cmd_timeout=cmd_timeout)
-    res = run_command(cmd)
-    return res.decode('ascii') if res is not None else None
-
-
-def get_real_names_local(users):
-    real_names_by_users = {}
-    for user in users:
-        try:
-            real_names_by_users[user] = pwd.getpwnam(user).pw_gecos
-        except KeyError:
-            pass
-    return defaultdict(lambda: 'Unknown', real_names_by_users)
-
-
-def get_real_names_remote(server, users, ssh_timeout, cmd_timeout):
-    users_str = ','.join(('\'{}\''.format(user) for user in users))
-    cmd = REMOTE_REAL_NAMES_CMD.format(server=server,
-                                       users=users_str,
-                                       ssh_timeout=ssh_timeout,
-                                       cmd_timeout=cmd_timeout)
-    res = run_command(cmd)
-    if res is not None:
-        res = res.decode('utf-8')
-        real_names_by_users = {user: s.strip()
-                               for user, s in zip(users, res.split('\n'))}
-        return defaultdict(lambda: 'Unknown', real_names_by_users)
-    else:
+    try:
+        return subprocess.check_output(
+            ["nvidia-smi", "-q", "-x"], timeout=args.cmd_timeout
+        )
+    except subprocess.TimeoutExpired:
+        logging.error("nvidia-smi command timed out")
+        return None
+    except subprocess.CalledProcessError as e:
+        logging.error(f"nvidia-smi command failed: {e}")
         return None
 
 
-def get_users_by_pid(ps_output):
-    users_by_pid = {}
-    for line in ps_output.strip().split('\n'):
-        pid, user = line.split()
-        users_by_pid[pid] = user
-
-    return users_by_pid
+def run_nvidiasmi_remote(server, ssh_timeout, cmd_timeout):
+    remote_cmd = f"timeout {cmd_timeout} nvidia-smi -q -x"
+    ssh_cmd = build_ssh_command(server, remote_cmd)
+    try:
+        return subprocess.check_output(ssh_cmd, timeout=ssh_timeout)
+    except subprocess.TimeoutExpired:
+        logging.error(f"Timeout while connecting to {server}")
+        return None
+    except subprocess.CalledProcessError as e:
+        logging.error(f"Error running nvidia-smi on {server}: {e}")
+        return None
 
 
 def get_gpu_infos(nvidiasmi_output):
-    gpus = nvidiasmi_output.findall('gpu')
-
+    if nvidiasmi_output is None:
+        return []
     gpu_infos = []
-    for idx, gpu in enumerate(gpus):
-        model = gpu.find('product_name').text
-        processes = gpu.findall('processes')[0]
-        pids = [process.find('pid').text for process in processes]
-        gpu_infos.append({'idx': idx, 'model': model, 'pids': pids})
-
+    root = ET.fromstring(nvidiasmi_output)
+    for gpu in root.findall("gpu"):
+        gpu_info = {
+            "index": gpu.find("minor_number").text,
+            "name": gpu.find("product_name").text,
+            "memory_total": int(gpu.find("fb_memory_usage/total").text.split()[0]),
+            "memory_used": int(gpu.find("fb_memory_usage/used").text.split()[0]),
+            "memory_free": int(gpu.find("fb_memory_usage/free").text.split()[0]),
+            "processes": [],
+        }
+        for process in gpu.findall("processes/process_info"):
+            pid = process.find("pid").text
+            used_memory = int(process.find("used_memory").text.split()[0])
+            gpu_info["processes"].append({"pid": pid, "used_memory": used_memory})
+        gpu_infos.append(gpu_info)
     return gpu_infos
 
 
-def print_free_gpus(server, gpu_infos):
-    free_gpus = [info for info in gpu_infos if len(info['pids']) == 0]
-
-    if len(free_gpus) == 0:
-        info('Server {}: No free GPUs :('.format(server))
-    else:
-        info('Server {}:'.format(server))
-        for gpu_info in free_gpus:
-            info('\tGPU {}, {}'.format(gpu_info['idx'], gpu_info['model']))
-
-
-def print_gpu_infos(server, gpu_infos, run_ps, run_get_real_names,
-                    filter_by_user=None,
-                    translate_to_real_names=False):
-    pids = [pid for gpu_info in gpu_infos for pid in gpu_info['pids']]
-    if len(pids) > 0:
-        ps = run_ps(pids=pids)
-        if ps is None:
-            error('Could not reach {} or error running ps'.format(server))
-            return
-
-        users_by_pid = get_users_by_pid(ps)
-    else:
-        users_by_pid = {}
-
-    if translate_to_real_names:
-        all_users = set((users_by_pid[pid] for gpu_info in gpu_infos
-                         for pid in gpu_info['pids']))
-        real_names_by_users = run_get_real_names(users=all_users)
-
-    info('Server {}:'.format(server))
-    for gpu_info in gpu_infos:
-        users = set((users_by_pid[pid] for pid in gpu_info['pids']))
-        if filter_by_user is not None and filter_by_user not in users:
-            continue
-
-        if len(gpu_info['pids']) == 0:
-            status = 'Free'
-        else:
-            if translate_to_real_names:
-                users = ['{} ({})'.format(user, real_names_by_users[user])
-                         for user in users]
-
-            status = 'Used by {}'.format(', '.join(users))
-
-        info('\tGPU {} ({}): {}'.format(gpu_info['idx'],
-                                        gpu_info['model'],
-                                        status))
-
-
-def main(argv):
-    args = parser.parse_args(argv)
-
-    logging.basicConfig(format='%(message)s',
-                        level=logging.DEBUG if args.verbose else logging.INFO)
-
-    if len(args.servers) == 0:
+def get_user_info(server, pids):
+    if not pids:
+        return {}
+    remote_cmd = f"ps -o user= -p {','.join(pids)}"
+    # For local host, run the command directly
+    if server.split()[0] in [".", "localhost", "127.0.0.1"]:
         try:
-            debug('Using server file {}'.format(args.server_file))
-            with open(args.server_file, 'r') as f:
-                servers = (s.strip() for s in f.readlines())
-                args.servers = [s for s in servers if s != '']
-        except OSError as e:
-            error('Could not open server file {}'.format(args.server_file))
-            return
+            output = subprocess.check_output(remote_cmd, shell=True, timeout=args.cmd_timeout)
+            output = output.decode().strip()
+            users = output.split("\n")
+            return dict(zip(pids, users))
+        except subprocess.TimeoutExpired:
+            logging.error(f"Command timed out on {server}")
+            return {}
+        except subprocess.CalledProcessError as e:
+            logging.error(f"Error getting user info on {server}: {e}")
+            return {}
+    else:
+        ssh_cmd = build_ssh_command(server, remote_cmd)
+        try:
+            output = subprocess.check_output(ssh_cmd, timeout=args.cmd_timeout)
+            output = output.decode().strip()
+            users = output.split("\n")
+            return dict(zip(pids, users))
+        except subprocess.TimeoutExpired:
+            logging.error(f"Command timed out on {server}")
+            return {}
+        except subprocess.CalledProcessError as e:
+            logging.error(f"Error getting user info on {server}: {e}")
+            return {}
 
-    if len(args.servers) == 0:
-        error(('No GPU servers to connect to specified.\nPut addresses in '
-               'the server file or specify them manually as an argument'))
+
+def display_gpu_infos(stdscr, server, gpu_infos, col, row_offset):
+    try:
+        stdscr.addstr(row_offset, col, f"Server: {server}")
+    except curses.error:
+        return row_offset
+    row = row_offset + 1
+    for gpu_info in gpu_infos:
+        if row >= curses.LINES - 1:
+            break
+        try:
+            stdscr.addstr(row, col, f"GPU {gpu_info['index']} - {gpu_info['name']}")
+            row += 1
+            stdscr.addstr(row, col, f"  Memory Total: {gpu_info['memory_total']} MiB")
+            row += 1
+            stdscr.addstr(row, col, f"  Memory Used: ", curses.color_pair(1))
+            stdscr.addstr(f"{gpu_info['memory_used']} MiB", curses.color_pair(2))
+            row += 1
+            stdscr.addstr(row, col, f"  Memory Free: ", curses.color_pair(1))
+            stdscr.addstr(f"{gpu_info['memory_free']} MiB", curses.color_pair(3))
+            row += 1
+
+            # Display user information with yellow highlight
+            pids = [process["pid"] for process in gpu_info["processes"]]
+            user_info = get_user_info(server, pids)
+            user_memory = defaultdict(int)
+            for process in gpu_info["processes"]:
+                user = user_info.get(process["pid"], "Unknown")
+                user_memory[user] += process["used_memory"]
+
+            for user, memory in user_memory.items():
+                stdscr.addstr(row, col, "  User: ", curses.color_pair(1))
+                stdscr.addstr(f"{user}", curses.color_pair(4))
+                stdscr.addstr(", Memory Used: ", curses.color_pair(1))
+                stdscr.addstr(f"{memory} MiB", curses.color_pair(4))
+                row += 1
+
+            row += 1
+        except curses.error:
+            break
+    if row < curses.LINES - 1:
+        try:
+            stdscr.addstr(row, col, "-" * (curses.COLS // 2 - 1))
+        except curses.error:
+            pass
+    row += 2
+    return row
+
+
+def main(stdscr, args):
+    curses.start_color()
+    curses.init_pair(1, curses.COLOR_WHITE, curses.COLOR_BLACK)
+    curses.init_pair(2, curses.COLOR_RED, curses.COLOR_BLACK)
+    curses.init_pair(3, curses.COLOR_GREEN, curses.COLOR_BLACK)
+    curses.init_pair(4, curses.COLOR_YELLOW, curses.COLOR_BLACK)  # Yellow text
+
+    if os.path.exists(args.server_file):
+        with open(args.server_file) as f:
+            servers = [line.strip() for line in f if line.strip()]
+    else:
+        logging.error(f"Server file {args.server_file} does not exist.")
         return
 
-    if args.ssh_user is not None:
-        args.servers = ['{}@{}'.format(args.ssh_user, server)
-                        for server in args.servers]
-    if args.me:
-        if args.ssh_user is not None:
-            args.user = args.ssh_user
-        else:
-            args.user = pwd.getpwuid(os.getuid()).pw_name
-    if args.user or args.finger:
-        args.list = True
+    while True:
+        stdscr.clear()
+        max_row, max_col = stdscr.getmaxyx()
+        col_width = max_col // 2
+        left_col_offset = 0
+        right_col_offset = 0
 
-    for server in args.servers:
-        if server == '.' or server == 'localhost' or server == '127.0.0.1':
-            run_nvidiasmi = run_nvidiasmi_local
-            run_ps = run_ps_local
-            run_get_real_names = get_real_names_local
-        else:
-            run_nvidiasmi = partial(run_nvidiasmi_remote,
-                                    server=server,
-                                    ssh_timeout=args.ssh_timeout,
-                                    cmd_timeout=args.cmd_timeout)
-            run_ps = partial(run_ps_remote,
-                             server=server,
-                             ssh_timeout=args.ssh_timeout,
-                             cmd_timeout=args.cmd_timeout)
-            run_get_real_names = partial(get_real_names_remote,
-                                         server=server,
-                                         ssh_timeout=args.ssh_timeout,
-                                         cmd_timeout=args.cmd_timeout)
+        for i, server in enumerate(servers):
+            if i % 2 == 0:
+                col = 0
+                row_offset = left_col_offset
+                nvidiasmi_output = (
+                    run_nvidiasmi_local()
+                    if server.split()[0] in [".", "localhost", "127.0.0.1"]
+                    else run_nvidiasmi_remote(server, args.ssh_timeout, args.cmd_timeout)
+                )
+                left_col_offset = display_gpu_infos(
+                    stdscr, server, get_gpu_infos(nvidiasmi_output), col, row_offset
+                )
+            else:
+                col = col_width + 1  # Adjusted for vertical separator
+                row_offset = right_col_offset
+                nvidiasmi_output = (
+                    run_nvidiasmi_local()
+                    if server.split()[0] in [".", "localhost", "127.0.0.1"]
+                    else run_nvidiasmi_remote(server, args.ssh_timeout, args.cmd_timeout)
+                )
+                right_col_offset = display_gpu_infos(
+                    stdscr, server, get_gpu_infos(nvidiasmi_output), col, row_offset
+                )
 
-        nvidiasmi = run_nvidiasmi()
-        if nvidiasmi is None:
-            error(('Could not reach {} or '
-                   'error running nvidia-smi').format(server))
-            continue
+        # Draw vertical separator
+        for row in range(max_row):
+            try:
+                stdscr.addch(row, col_width, "|")
+            except curses.error:
+                pass
 
-        gpu_infos = get_gpu_infos(nvidiasmi)
-
-        if args.list:
-            print_gpu_infos(server, gpu_infos, run_ps, run_get_real_names,
-                            filter_by_user=args.user,
-                            translate_to_real_names=args.finger)
-        else:
-            print_free_gpus(server, gpu_infos)
+        stdscr.refresh()
+        time.sleep(args.refresh_interval)
 
 
-if __name__ == '__main__':
-    main(sys.argv[1:])
+if __name__ == "__main__":
+    curses.wrapper(main, args)
